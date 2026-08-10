@@ -1,0 +1,1843 @@
+"""LLMAgentPolicy end-to-end through real eval() on the mock cubepick world.
+
+Conversations are scripted with httpx.MockTransport: no network, no LLM, no
+hardware — the whole loop (bind, observation payloads, tool synthesis,
+guardrails, policy-stop, budgets, error taxonomy) runs for real.
+"""
+
+from __future__ import annotations
+
+import io
+import json
+import sys
+from dataclasses import replace
+from pathlib import Path
+from typing import Any, cast
+
+import httpx
+import numpy as np
+import pytest
+
+from inspect_robots import eval as ir_eval
+from inspect_robots.approver import ChainApprover, ClampApprover, DeltaLimitApprover
+from inspect_robots.controller import DefaultController
+from inspect_robots.embodiment import EmbodimentInfo
+from inspect_robots.errors import ConfigError
+from inspect_robots.logging.sink import NullSink
+from inspect_robots.mock import CubePickEmbodiment
+from inspect_robots.rollout import TrialRecord
+from inspect_robots.scene import Scene
+from inspect_robots.scorer import success_at_end
+from inspect_robots.spaces import (
+    ActionSemantics,
+    Box,
+    CameraSpec,
+    ObservationSpace,
+    StateField,
+    StateSpec,
+)
+from inspect_robots.task import Task
+from inspect_robots.types import Action, Observation, StepResult
+from inspect_robots_agent import LLMAgentPolicy
+from inspect_robots_agent._llm import ChatClient, resolve_provider
+from inspect_robots_agent._png import encode_png
+from inspect_robots_agent.policy import _SYSTEM_TEMPLATE, AgentPolicyConfig, _observation_content
+
+# --- scripted-conversation harness ---------------------------------------------
+
+_MOVE_TOOL_NAMES = frozenset({"move_joints", "move_to", "move_by"})
+_DEFAULT_MOVE_NOTE = "The target is ahead, so I chose this motion to move toward it."
+_NOTE_CONTRACT = (
+    "Every move tool call must include a `note`: in one or two sentences, say what you observe "
+    "in the current observation and why you chose this motion. The user is watching these notes "
+    "to see what you see and what you decide, so write them for a human reader."
+)
+_NOTE_ERROR = "note is required: describe what you observe and why you chose this motion"
+
+
+def _with_default_note(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    wire_arguments = dict(arguments)
+    if name in _MOVE_TOOL_NAMES:
+        wire_arguments.setdefault("note", _DEFAULT_MOVE_NOTE)
+    return wire_arguments
+
+
+def _tool_response(
+    name: str,
+    arguments: dict[str, Any],
+    *,
+    add_default_note: bool = True,
+) -> dict[str, Any]:
+    wire_arguments = _with_default_note(name, arguments) if add_default_note else arguments
+    return {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": f"call_{name}",
+                            "type": "function",
+                            "function": {"name": name, "arguments": json.dumps(wire_arguments)},
+                        }
+                    ],
+                }
+            }
+        ]
+    }
+
+
+def _text_response(text: str) -> dict[str, Any]:
+    return {"choices": [{"message": {"role": "assistant", "content": text}}]}
+
+
+def _text_and_tool_response(text: str, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": text,
+                    "tool_calls": [
+                        {
+                            "id": f"call_{name}",
+                            "type": "function",
+                            "function": {"name": name, "arguments": json.dumps(arguments)},
+                        }
+                    ],
+                }
+            }
+        ]
+    }
+
+
+def _multi_tool_response(calls: list[tuple[str, dict[str, Any]]]) -> dict[str, Any]:
+    return {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": f"call_{index}",
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                "arguments": json.dumps(_with_default_note(name, arguments)),
+                            },
+                        }
+                        for index, (name, arguments) in enumerate(calls)
+                    ],
+                }
+            }
+        ]
+    }
+
+
+class _Script:
+    """Serves queued responses; repeats the last one when the queue runs dry."""
+
+    def __init__(self, responses: list[dict[str, Any]]):
+        self.queue = list(responses)
+        self.requests: list[dict[str, Any]] = []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(json.loads(request.content))
+        payload = self.queue.pop(0) if len(self.queue) > 1 else self.queue[0]
+        return httpx.Response(200, json=payload)
+
+
+class _FlushRecordingStream(io.StringIO):
+    def __init__(self) -> None:
+        super().__init__()
+        self.write_calls: list[str] = []
+        self.flush_calls = 0
+
+    def write(self, text: str) -> int:
+        self.write_calls.append(text)
+        return super().write(text)
+
+    def flush(self) -> None:
+        self.flush_calls += 1
+        super().flush()
+
+
+def _policy(script: _Script, **kwargs: Any) -> LLMAgentPolicy:
+    return LLMAgentPolicy(
+        model="test/model",
+        base_url="http://llm.test/v1",
+        transport=httpx.MockTransport(script),
+        env={},
+        **kwargs,
+    )
+
+
+def _task(max_steps: int = 40) -> Task:
+    return Task(
+        name="t",
+        scenes=[Scene(id="s0", instruction="reach the cube", init_seed=0)],
+        scorer=success_at_end(),
+        max_steps=max_steps,
+    )
+
+
+class _RecordingSink(NullSink):
+    def __init__(self) -> None:
+        self.records: list[TrialRecord] = []
+
+    def on_trial_end(self, record: TrialRecord) -> None:
+        self.records.append(record)
+
+
+class _AbsoluteEmbodiment:
+    def __init__(self) -> None:
+        self._q = np.array([0.0])
+        self.info = EmbodimentInfo(
+            name="absolute-test",
+            action_space=Box(
+                shape=(1,),
+                low=np.array([-1.0]),
+                high=np.array([1.0]),
+                semantics=ActionSemantics("joint_pos", dim_labels=("joint",)),
+            ),
+            observation_space=ObservationSpace(
+                state=StateSpec(fields=(StateField(key="q", shape=(1,)),))
+            ),
+            control_hz=10.0,
+            is_simulated=True,
+        )
+
+    def reset(self, scene: Scene, *, seed: int | None = None) -> Observation:
+        self._q = np.array([0.0])
+        return Observation(state={"q": self._q.copy()}, instruction=scene.instruction)
+
+    def step(self, action: Action) -> StepResult:
+        self._q = np.asarray(action.data, dtype=np.float64).copy()
+        return StepResult(observation=Observation(state={"q": self._q.copy()}))
+
+    def close(self) -> None:
+        return None
+
+
+class _VisionAbsoluteEmbodiment:
+    def __init__(self, *, terminate_after_first_step: bool = False) -> None:
+        self._q = np.array([0.0])
+        self._steps = 0
+        self._terminate_after_first_step = terminate_after_first_step
+        self.info = EmbodimentInfo(
+            name="vision-absolute-test",
+            action_space=Box(
+                shape=(1,),
+                low=np.array([-1.0]),
+                high=np.array([1.0]),
+                semantics=ActionSemantics("joint_pos", dim_labels=("joint",)),
+            ),
+            observation_space=ObservationSpace(
+                cameras=(
+                    CameraSpec(name="top", height=2, width=2, channels=3),
+                    CameraSpec(name="wrist", height=2, width=2, channels=3),
+                ),
+                state=StateSpec(fields=(StateField(key="q", shape=(1,)),)),
+            ),
+            control_hz=10.0,
+            is_simulated=True,
+        )
+
+    def reset(self, scene: Scene, *, seed: int | None = None) -> Observation:
+        self._q = np.array([0.0])
+        self._steps = 0
+        return self._observe(scene.instruction)
+
+    def step(self, action: Action) -> StepResult:
+        self._steps += 1
+        self._q = np.asarray(action.data, dtype=np.float64).copy()
+        terminated = self._terminate_after_first_step and self._steps == 1
+        return StepResult(
+            observation=self._observe(None),
+            terminated=terminated,
+            termination_reason="test termination" if terminated else None,
+        )
+
+    def close(self) -> None:
+        return None
+
+    def _observe(self, instruction: str | None) -> Observation:
+        return Observation(
+            images={
+                "top": np.full((2, 2, 3), self._steps, dtype=np.uint8),
+                "wrist": np.full((2, 2, 3), self._steps + 10, dtype=np.uint8),
+            },
+            state={"q": self._q.copy()},
+            instruction=instruction,
+        )
+
+
+def _vision_observation(
+    *,
+    q: float = 0.0,
+    env_step: object = 0,
+    cameras: tuple[str, ...] = ("top", "wrist"),
+) -> Observation:
+    images = {
+        name: np.full((2, 2, 3), index, dtype=np.uint8)
+        for index, name in enumerate(cameras, start=1)
+    }
+    return Observation(state={"q": np.array([q])}, images=images, extra={"env_step": env_step})
+
+
+# --- tests -----------------------------------------------------------------------
+
+
+def test_goal_runs_to_done_and_config_lands_in_log(tmp_path: Path) -> None:
+    script = _Script(
+        [
+            _tool_response("move_by", {"deltas": {"dx": 0.1, "dy": 0.1}}),
+            _tool_response("done", {"summary": "close enough"}),
+        ]
+    )
+    sink = _RecordingSink()
+    logs = ir_eval(
+        _task(), _policy(script), CubePickEmbodiment(), log_dir=str(tmp_path), sinks=[sink]
+    )
+    assert logs[0].status == "success"
+    (record,) = sink.records
+    assert record.truncated is True
+    assert record.termination_reason == "done"
+    # Headroom splits a box-sized move into two steps, then done holds once.
+    assert len(record.steps) == 3
+    assert logs[0].eval.policy_config["model"] == "test/model"
+    assert logs[0].eval.policy_config["max_llm_calls"] == 100
+    assert logs[0].eval.policy_config["max_speed_frac"] == 0.1
+    (transcript,) = logs[0].samples[0].policy_transcripts
+    serialized = json.dumps(logs[0].to_dict())
+    assert transcript is not None
+    assert "move_by" in serialized and "done" in serialized
+    assert "data:" not in serialized
+
+
+def test_transcript_is_none_before_first_reset() -> None:
+    policy = _policy(_Script([_text_response("unused")]))
+    assert policy.transcript() is None
+
+
+def test_reset_before_bind_uses_the_unchanged_unbound_prompt() -> None:
+    policy = _policy(_Script([_text_response("unused")]))
+    policy.reset(Scene(id="s0", instruction="reach"))
+
+    transcript = policy.transcript()
+
+    assert transcript is not None
+    assert transcript[0]["content"] == _SYSTEM_TEMPLATE.format(name="(unbound)", budget=100)
+
+
+def test_embodiment_docs_are_appended_verbatim_after_formatting() -> None:
+    docs = '  Keep {x/y} literal.\n```json\n{"open": 1}\n```  '
+    info = replace(CubePickEmbodiment().info, docs=docs)
+    policy = _policy(_Script([_text_response("unused")]))
+    policy.bind(info)
+    policy.reset(Scene(id="s0", instruction="reach"))
+
+    transcript = policy.transcript()
+
+    assert transcript is not None
+    assert transcript[0]["content"] == (
+        _SYSTEM_TEMPLATE.format(name="cubepick", budget=100)
+        + "\n\nEmbodiment notes:\n"
+        + docs.strip()
+    )
+
+
+@pytest.mark.parametrize("docs", [None, "", " \n\t "])
+def test_absent_embodiment_docs_leave_the_prompt_unchanged(docs: str | None) -> None:
+    info = replace(CubePickEmbodiment().info, docs=docs)
+    policy = _policy(_Script([_text_response("unused")]))
+    policy.bind(info)
+    policy.reset(Scene(id="s0", instruction="reach"))
+
+    transcript = policy.transcript()
+
+    assert transcript is not None
+    assert transcript[0]["content"] == _SYSTEM_TEMPLATE.format(name="cubepick", budget=100)
+
+
+def test_system_prompt_requires_human_readable_move_notes() -> None:
+    policy = _policy(_Script([_text_response("unused")]))
+    policy.bind(CubePickEmbodiment().info)
+    policy.reset(Scene(id="s0", instruction="reach"))
+
+    transcript = policy.transcript()
+
+    assert transcript is not None
+    assert _NOTE_CONTRACT in transcript[0]["content"]
+
+
+def test_bind_accepts_legacy_embodiment_info_without_docs() -> None:
+    current = CubePickEmbodiment().info
+
+    class _LegacyInfo:
+        name = current.name
+        action_space = current.action_space
+        observation_space = current.observation_space
+        control_hz = current.control_hz
+
+    policy = _policy(_Script([_text_response("unused")]))
+    policy.bind(cast(EmbodimentInfo, _LegacyInfo()))
+    policy.reset(Scene(id="s0", instruction="reach"))
+
+    transcript = policy.transcript()
+
+    assert transcript is not None
+    assert "Embodiment notes:" not in transcript[0]["content"]
+
+
+def test_observation_content_labels_the_selected_state_field_exactly() -> None:
+    content = _observation_content(
+        Observation(state={"joint_pos": np.array([0.01, -0.02, 0.98])}),
+        ("joint_pos", ("left_j0", "left_j1", "right_gripper")),
+    )
+
+    assert content == [
+        {
+            "type": "text",
+            "text": (
+                "Current observation.\n"
+                "state[joint_pos]: left_j0=0.01 left_j1=-0.02 right_gripper=0.98"
+            ),
+        }
+    ]
+
+
+def test_observation_content_uses_unlabeled_fallback_for_length_mismatch() -> None:
+    content = _observation_content(
+        Observation(state={"joint_pos": np.array([0.01, -0.02])}),
+        ("joint_pos", ("left_j0", "left_j1", "right_gripper")),
+    )
+
+    assert content[0]["text"] == "Current observation.\nstate[joint_pos]: [0.01, -0.02]"
+
+
+def test_observation_content_labels_every_camera_with_the_environment_step() -> None:
+    image = np.zeros((1, 1, 3), dtype=np.uint8)
+
+    content = _observation_content(
+        Observation(
+            images={"top_cam": image, "left_cam": image},
+            extra={"env_step": 480},
+        )
+    )
+
+    assert content[1]["text"] == "camera 'top_cam' (step 480):"
+    assert content[2]["type"] == "image_url"
+    assert content[3]["text"] == "camera 'left_cam' (step 480):"
+    assert content[4]["type"] == "image_url"
+
+
+def test_observation_content_step_label_fallbacks() -> None:
+    image = np.zeros((1, 1, 3), dtype=np.uint8)
+
+    without_step = _observation_content(Observation(images={"top": image}))
+    string_step = _observation_content(
+        Observation(images={"top": image}, extra={"env_step": "480"})
+    )
+    bool_step = _observation_content(Observation(images={"top": image}, extra={"env_step": True}))
+    numpy_step = _observation_content(
+        Observation(images={"top": image}, extra={"env_step": np.int64(480)})
+    )
+
+    assert without_step[1]["text"] == "camera 'top':"
+    assert string_step[1]["text"] == "camera 'top':"
+    assert bool_step[1]["text"] == "camera 'top' (step True):"
+    assert numpy_step[1]["text"] == "camera 'top':"
+
+
+def test_transcript_echo_defaults_off(capsys: pytest.CaptureFixture[str]) -> None:
+    policy = _policy(_Script([_tool_response("done", {"summary": "quiet"})]))
+    policy.bind(CubePickEmbodiment().info)
+    policy.reset(Scene(id="s0", instruction="observe quietly"))
+    policy.act(Observation(extra={"env_step": 0}))
+
+    assert capsys.readouterr().err == ""
+
+
+def test_transcript_echo_reports_conversation_in_order(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    policy = _policy(
+        _Script([_text_and_tool_response("The goal is complete.", "done", {"summary": "ok"})]),
+        transcript_echo=True,
+    )
+    policy.bind(CubePickEmbodiment().info)
+    policy.reset(Scene(id="s0", instruction="inspect the cube"))
+    policy.act(
+        Observation(
+            state={"eef_pos": np.array([0.123456, -0.2])},
+            extra={"env_step": 0},
+        )
+    )
+
+    lines = capsys.readouterr().err.splitlines()
+    expected = [
+        "[agent] goal: inspect the cube",
+        "[agent] >> step 0: 0 camera(s), state[eef_pos]: [0.1235, -0.2]",
+        "[agent] << The goal is complete.",
+        '[agent] << tool_call done({"summary": "ok"})',
+        "[agent] -- done: ok",
+    ]
+    positions = [lines.index(line) for line in expected]
+    assert positions == sorted(positions)
+
+
+def test_transcript_echo_reports_tool_results_in_call_order(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    policy = _policy(
+        _Script(
+            [
+                _multi_tool_response(
+                    [
+                        ("done", {"summary": "first executes"}),
+                        ("give_up", {"reason": "extra"}),
+                        ("give_up", {"reason": "second extra"}),
+                    ]
+                )
+            ]
+        ),
+        transcript_echo=True,
+    )
+    policy.bind(CubePickEmbodiment().info)
+    policy.reset(Scene(id="s0", instruction="stop"))
+    policy.act(Observation(extra={"env_step": 0}))
+
+    event_lines = [
+        line
+        for line in capsys.readouterr().err.splitlines()
+        if "tool_call" in line or line.startswith("[agent] --")
+    ]
+    assert event_lines == [
+        '[agent] << tool_call done({"summary": "first executes"})',
+        '[agent] << tool_call give_up({"reason": "extra"})',
+        '[agent] << tool_call give_up({"reason": "second extra"})',
+        "[agent] -- done: first executes",
+        "[agent] -- ignored: one tool call per turn",
+        "[agent] -- ignored: one tool call per turn",
+    ]
+
+
+def test_transcript_echo_flushes_every_event(monkeypatch: pytest.MonkeyPatch) -> None:
+    policy = _policy(
+        _Script([_tool_response("done", {"summary": "flushed"})]), transcript_echo=True
+    )
+    policy.bind(CubePickEmbodiment().info)
+    policy.reset(Scene(id="s0", instruction="flush"))
+    stream = _FlushRecordingStream()
+    monkeypatch.setattr(sys, "stderr", stream)
+
+    policy.act(Observation(extra={"env_step": 0}))
+
+    newline_count = sum(part.count("\n") for part in stream.write_calls)
+    assert newline_count > 0
+    assert stream.flush_calls >= newline_count
+
+
+def test_transcript_echo_observation_omits_image_payloads(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    policy = _policy(
+        _Script([_tool_response("done", {"summary": "observed"})]), transcript_echo=True
+    )
+    policy.bind(CubePickEmbodiment().info)
+    policy.reset(Scene(id="s0", instruction="observe"))
+    policy.act(
+        Observation(
+            state={"eef_pos": np.array([0.123456])},
+            images={"top": np.zeros((1, 1, 3), dtype=np.uint8)},
+            extra={"env_step": 0},
+        )
+    )
+
+    stderr = capsys.readouterr().err
+    assert "[agent] >> step 0: 1 camera(s), state[eef_pos]: [0.1235]" in stderr
+    assert "data:image" not in stderr
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [{}, {"env_step": "3"}],
+    ids=["missing", "non_int_string"],
+)
+def test_transcript_echo_observation_without_environment_step(
+    extra: dict[str, Any], capsys: pytest.CaptureFixture[str]
+) -> None:
+    policy = _policy(
+        _Script([_tool_response("done", {"summary": "observed"})]), transcript_echo=True
+    )
+    policy.bind(CubePickEmbodiment().info)
+    policy.reset(Scene(id="s0", instruction="observe"))
+    policy.act(Observation(state={"eef_pos": np.array([0.0])}, extra=extra))
+
+    stderr = capsys.readouterr().err
+    assert "[agent] >> observation: 0 camera(s), state[eef_pos]: [0.0]" in stderr
+    assert ">> step" not in stderr
+
+
+def test_transcript_echo_never_echoes_retry_nudge(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    policy = _policy(
+        _Script(
+            [
+                _text_response("thinking out loud, no tool call"),
+                _tool_response("done", {"summary": "recovered"}),
+            ]
+        ),
+        transcript_echo=True,
+    )
+    policy.bind(CubePickEmbodiment().info)
+    policy.reset(Scene(id="s0", instruction="recover"))
+    policy.act(Observation(extra={"env_step": 0}))
+
+    stderr = capsys.readouterr().err
+    assert "[agent] << thinking out loud, no tool call" in stderr
+    assert "Respond with exactly one tool call." not in stderr
+
+
+def test_transcript_echo_reports_forced_give_up(capsys: pytest.CaptureFixture[str]) -> None:
+    policy = _policy(
+        _Script([_tool_response("move_by", {"deltas": {"dx": 0.01}})]),
+        max_llm_calls=1,
+        transcript_echo=True,
+    )
+    policy.bind(CubePickEmbodiment().info)
+    policy.reset(Scene(id="s0", instruction="move"))
+    policy.act(Observation(extra={"env_step": 0}))
+    policy.act(Observation(extra={"env_step": 1}))
+
+    assert "[agent] -- LLM call budget exhausted; forcing give_up" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        _tool_response("done", {"summary": "no text"}),
+        _text_and_tool_response("", "done", {"summary": "no text"}),
+    ],
+    ids=["content_none", "content_empty_string"],
+)
+def test_transcript_echo_omits_empty_assistant_text(
+    response: dict[str, Any], capsys: pytest.CaptureFixture[str]
+) -> None:
+    policy = _policy(_Script([response]), transcript_echo=True)
+    policy.bind(CubePickEmbodiment().info)
+    policy.reset(Scene(id="s0", instruction="stop"))
+    policy.act(Observation(extra={"env_step": 0}))
+
+    assistant_lines = [
+        line for line in capsys.readouterr().err.splitlines() if line.startswith("[agent] <<")
+    ]
+    assert assistant_lines == ['[agent] << tool_call done({"summary": "no text"})']
+
+
+def test_transcript_echo_lands_in_policy_config() -> None:
+    policy = _policy(_Script([_text_response("unused")]), transcript_echo=True)
+
+    assert isinstance(policy.config, AgentPolicyConfig)
+    assert policy.config.transcript_echo is True
+
+
+def test_transcript_preserves_step_label_next_to_elided_image() -> None:
+    policy = _policy(_Script([_tool_response("done", {"summary": "observed"})]))
+    policy.bind(CubePickEmbodiment().info)
+    policy.reset(Scene(id="s0", instruction="observe"))
+    policy.act(
+        Observation(
+            images={"top_cam": np.zeros((1, 1, 3), dtype=np.uint8)},
+            extra={"env_step": 480},
+        )
+    )
+
+    transcript = policy.transcript()
+
+    assert transcript is not None
+    assert transcript[-3]["content"][-2:] == [
+        {"type": "text", "text": "camera 'top_cam' (step 480):"},
+        {"type": "text", "text": "[image omitted: streamed camera frame]"},
+    ]
+
+
+def test_transcript_strips_images_and_preserves_text_and_tools() -> None:
+    policy = _policy(_Script([_text_response("unused")]))
+    policy.reset(Scene(id="s0", instruction="reach"))
+    tool_call = {
+        "id": "call_move",
+        "type": "function",
+        "function": {"name": "move_by", "arguments": '{"dx": 0.1}'},
+    }
+    policy._messages.extend(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "camera 'top':"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,secret"},
+                    },
+                ],
+            },
+            {"role": "assistant", "content": None, "tool_calls": [tool_call]},
+            {"role": "tool", "tool_call_id": "call_move", "content": "moved"},
+        ]
+    )
+
+    transcript = policy.transcript()
+
+    assert transcript is not None
+    assert transcript[-3]["content"] == [
+        {"type": "text", "text": "camera 'top':"},
+        {"type": "text", "text": "[image omitted: streamed camera frame]"},
+    ]
+    assert transcript[-2]["tool_calls"] == [tool_call]
+    assert transcript[-1] == {
+        "role": "tool",
+        "tool_call_id": "call_move",
+        "content": "moved",
+    }
+
+
+def test_transcript_is_deeply_isolated_in_both_directions() -> None:
+    policy = _policy(_Script([_text_response("unused")]))
+    policy.reset(Scene(id="s0", instruction="reach"))
+    first = policy.transcript()
+    assert first is not None
+
+    first[0]["content"] = "changed return"
+    assert policy._messages[0]["content"] != "changed return"
+
+    policy._messages[1]["content"] = "changed live state"
+    assert first[1]["content"] == "Goal: reach"
+
+
+def test_transcript_delta_tracks_new_sanitized_messages_and_reset() -> None:
+    script = _Script(
+        [
+            _tool_response("move_by", {"deltas": {"dx": 0.05}}),
+            _tool_response("done", {"summary": "finished"}),
+        ]
+    )
+    policy = _policy(script)
+    policy.bind(CubePickEmbodiment().info)
+    scene = Scene(id="s0", instruction="reach")
+    image = np.zeros((1, 1, 3), dtype=np.uint8)
+    policy.reset(scene)
+
+    policy.act(Observation(images={"top": image}))
+    first = policy.transcript_delta()
+    assert first is not None
+    assert policy.transcript_delta() is None
+    assert "data:image" not in json.dumps(first)
+
+    policy.act(Observation(images={"top": image}))
+    second = policy.transcript_delta()
+    assert second is not None
+    assert second[0]["role"] == "user"
+    assert all(message["role"] != "system" for message in second)
+    assert "data:image" not in json.dumps(second)
+
+    full = policy.transcript()
+    assert full is not None
+    assert len(full) == len(first) + len(second)
+    assert full[: len(first)] == first
+    assert full[len(first) :] == second
+
+    policy.reset(scene)
+    reset_delta = policy.transcript_delta()
+    assert reset_delta is not None
+    assert [message["role"] for message in reset_delta] == ["system", "user"]
+
+
+def test_outbound_messages_carry_state_images_and_tools(tmp_path: Path) -> None:
+    script = _Script([_tool_response("done", {"summary": "looked around"})])
+    ir_eval(_task(), _policy(script), CubePickEmbodiment(), log_dir=str(tmp_path))
+    first = script.requests[0]
+    assert first["model"] == "test/model"
+    assert [t["function"]["name"] for t in first["tools"]] == ["move_by", "done", "give_up"]
+    system, goal, observation = first["messages"]
+    assert "cubepick" in system["content"]
+    assert "Embodiment notes:\n" in system["content"]
+    docs = CubePickEmbodiment().info.docs
+    assert docs is not None and docs in system["content"]
+    assert goal["content"] == "Goal: reach the cube"
+    text_parts = [p["text"] for p in observation["content"] if p["type"] == "text"]
+    assert any("state[eef_pos]" in t for t in text_parts)
+    image_parts = [p for p in observation["content"] if p["type"] == "image_url"]
+    assert image_parts and image_parts[0]["image_url"]["url"].startswith("data:image/png;base64,")
+
+
+def test_wild_swing_is_clamped_by_guardrails_but_not_without(tmp_path: Path) -> None:
+    def run(approver: Any) -> TrialRecord:
+        script = _Script(
+            [
+                _tool_response("move_by", {"deltas": {"dx": 0.08}}),
+                _tool_response("done", {"summary": "stop"}),
+            ]
+        )
+        sink = _RecordingSink()
+        ir_eval(
+            _task(),
+            _policy(script),
+            CubePickEmbodiment(),
+            log_dir=str(tmp_path),
+            sinks=[sink],
+            approver=approver,
+        )
+        return sink.records[0]
+
+    space = CubePickEmbodiment().info.action_space
+    guarded = run(ChainApprover(ClampApprover(space), DeltaLimitApprover(space, max_delta=0.02)))
+    approvals = [e for e in guarded.events if e.kind == "approval"]
+    assert approvals
+    assert any(e.data.get("detail") == "delta_clamped" for e in approvals)
+    assert float(np.asarray(guarded.steps[0].action.data)[0]) == 0.02
+
+    unguarded = run(None)  # eval()'s Python-API default is the permissive AutoApprover
+    assert not [e for e in unguarded.events if e.kind == "approval"]
+    assert float(np.asarray(unguarded.steps[0].action.data)[0]) == 0.08
+
+
+def test_llm_call_budget_forces_give_up(tmp_path: Path) -> None:
+    script = _Script([_tool_response("move_by", {"deltas": {"dx": 0.05}})])
+    sink = _RecordingSink()
+    logs = ir_eval(
+        _task(),
+        _policy(script, max_llm_calls=1),
+        CubePickEmbodiment(),
+        log_dir=str(tmp_path),
+        sinks=[sink],
+    )
+    assert logs[0].status == "success"
+    (record,) = sink.records
+    assert record.termination_reason == "give_up"
+
+
+def test_persistent_non_tool_output_becomes_policy_error(tmp_path: Path) -> None:
+    script = _Script([_text_response("I would rather write a poem about the cube.")])
+    sink = _RecordingSink()
+    logs = ir_eval(
+        _task(), _policy(script), CubePickEmbodiment(), log_dir=str(tmp_path), sinks=[sink]
+    )
+    # A PolicyError marks the trial errored (never scored); the eval still
+    # returns a log, and with its only trial errored the log reports "error".
+    (sample,) = logs[0].samples
+    assert sample.status == "error"
+    assert logs[0].status == "error"
+    (record,) = sink.records
+    assert record.error is not None and "no tool call" in record.error
+
+
+def test_recoverable_tool_error_is_fed_back_and_corrected(tmp_path: Path) -> None:
+    script = _Script(
+        [
+            _tool_response("move_by", {"deltas": {"dz": 0.1}}),  # bad dim
+            _tool_response("move_by", {"deltas": {"dx": 0.1}}),
+            _tool_response("done", {"summary": "recovered"}),
+        ]
+    )
+    sink = _RecordingSink()
+    logs = ir_eval(
+        _task(), _policy(script), CubePickEmbodiment(), log_dir=str(tmp_path), sinks=[sink]
+    )
+    assert logs[0].status == "success"
+    assert sink.records[0].termination_reason == "done"
+    # The error went back to the model as a tool message naming the offender.
+    tool_messages = [
+        m for request in script.requests for m in request["messages"] if m.get("role") == "tool"
+    ]
+    assert any("unknown dimension 'dz'" in str(m["content"]) for m in tool_messages)
+
+
+def test_missing_note_is_fed_back_and_corrected_in_persisted_transcript(
+    tmp_path: Path,
+) -> None:
+    corrected_note = "The cube is still ahead, so I will move the end effector toward it."
+    script = _Script(
+        [
+            _tool_response(
+                "move_by",
+                {"deltas": {"dx": 0.05}},
+                add_default_note=False,
+            ),
+            _tool_response(
+                "move_by",
+                {"deltas": {"dx": 0.05}, "note": corrected_note},
+            ),
+            _tool_response("done", {"summary": "corrected"}),
+        ]
+    )
+    logs = ir_eval(_task(), _policy(script), CubePickEmbodiment(), log_dir=str(tmp_path))
+
+    assert logs[0].status == "success"
+    correction_messages = [
+        message for message in script.requests[1]["messages"] if message.get("role") == "tool"
+    ]
+    assert any(message["content"] == _NOTE_ERROR for message in correction_messages)
+
+    (transcript,) = logs[0].samples[0].policy_transcripts
+    assert transcript is not None
+    tool_arguments = [
+        json.loads(call["function"]["arguments"])
+        for message in transcript
+        for call in message.get("tool_calls", [])
+    ]
+    assert any(arguments.get("note") == corrected_note for arguments in tool_arguments)
+
+
+def test_persistent_tool_errors_become_policy_error(tmp_path: Path) -> None:
+    script = _Script([_tool_response("move_by", {"deltas": {"dz": 0.1}})])
+    sink = _RecordingSink()
+    logs = ir_eval(
+        _task(), _policy(script), CubePickEmbodiment(), log_dir=str(tmp_path), sinks=[sink]
+    )
+    assert logs[0].status == "error"
+    assert sink.records[0].error is not None
+    assert "tool calls kept failing" in sink.records[0].error
+
+
+def test_extra_tool_calls_are_answered_but_not_executed(tmp_path: Path) -> None:
+    script = _Script(
+        [
+            _multi_tool_response(
+                [
+                    ("move_by", {"deltas": {"dx": 0.05}}),
+                    ("give_up", {"reason": "extra"}),
+                ]
+            ),
+            _tool_response("done", {"summary": "only the first call ran"}),
+        ]
+    )
+    sink = _RecordingSink()
+    ir_eval(_task(), _policy(script), CubePickEmbodiment(), log_dir=str(tmp_path), sinks=[sink])
+    assert sink.records[0].termination_reason == "done"
+    results = [
+        message for message in script.requests[1]["messages"] if message.get("role") == "tool"
+    ]
+    assert results == [
+        {
+            "role": "tool",
+            "tool_call_id": "call_0",
+            "content": "executing move_by over 1 steps (0.1s)",
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": "ignored: one tool call per turn",
+        },
+    ]
+
+
+def test_extras_behind_a_failed_call_name_the_failure_in_always_mode() -> None:
+    # The reason string is not scoped to on-demand mode: blaming the model for
+    # a surplus call when the real cause was the earlier failure misleads it in
+    # either mode.
+    script = _Script(
+        [
+            _multi_tool_response(
+                [
+                    ("move_by", {"deltas": {"nope": 0.05}}),
+                    ("give_up", {"reason": "extra"}),
+                ]
+            ),
+            _tool_response("done", {"summary": "recovered"}),
+        ]
+    )
+    policy = _policy(script)
+    policy.bind(CubePickEmbodiment().info)
+    policy.reset(Scene(id="s0", instruction="stop"))
+
+    policy.act(Observation(extra={"env_step": 0}))
+
+    results = [message["content"] for message in policy._messages if message.get("role") == "tool"]
+    assert results[0].startswith("unknown dimension 'nope'")
+    assert results[1] == "ignored: an earlier call in this turn failed"
+
+
+def test_on_demand_observation_names_available_cameras_without_sending_frames() -> None:
+    script = _Script([_tool_response("done", {"summary": "observed state"})])
+    policy = _policy(script, images="on_demand")
+    embodiment = _VisionAbsoluteEmbodiment()
+    policy.bind(embodiment.info)
+    policy.reset(Scene(id="s0", instruction="look selectively"))
+
+    policy.act(_vision_observation())
+
+    observation = script.requests[0]["messages"][-1]
+    assert observation["role"] == "user"
+    assert observation["content"][0]["text"].endswith(
+        "Cameras available to take_pic: 'top', 'wrist'."
+    )
+    assert all(part["type"] != "image_url" for part in observation["content"])
+    assert [tool["function"]["name"] for tool in script.requests[0]["tools"]] == [
+        "move_joints",
+        "done",
+        "give_up",
+        "take_pic",
+    ]
+
+
+def test_immediate_capture_appends_results_then_frames_and_redecides() -> None:
+    script = _Script(
+        [
+            _tool_response(
+                "take_pic",
+                {"cameras": ["top"], "note": "I need to inspect the top view first."},
+            ),
+            _tool_response("done", {"summary": "looked"}),
+        ]
+    )
+    policy = _policy(script, images="on_demand")
+    policy.bind(_VisionAbsoluteEmbodiment().info)
+    policy.reset(Scene(id="s0", instruction="look"))
+
+    chunk = policy.act(_vision_observation(env_step=7))
+
+    assert chunk.actions[0].meta["request_stop"] is True
+    assert len(script.requests) == 2
+    history = script.requests[1]["messages"]
+    assistant_index = next(
+        index
+        for index, message in enumerate(history)
+        if message.get("tool_calls") and message["tool_calls"][0]["function"]["name"] == "take_pic"
+    )
+    assert history[assistant_index + 1] == {
+        "role": "tool",
+        "tool_call_id": "call_take_pic",
+        "content": "captured 1 frame(s): 'top'",
+    }
+    frame_message = history[assistant_index + 2]
+    assert frame_message["role"] == "user"
+    assert frame_message["content"][0]["text"] == "camera 'top' (step 7):"
+    assert frame_message["content"][1]["type"] == "image_url"
+
+
+def test_immediate_capture_validation_errors_increment_failures() -> None:
+    script = _Script([_tool_response("take_pic", {})])
+    policy = _policy(script, images="on_demand", max_llm_calls=50)
+    policy.bind(_VisionAbsoluteEmbodiment().info)
+    policy.reset(Scene(id="s0", instruction="look"))
+
+    with pytest.raises(
+        RuntimeError,
+        match="last error: note is required",
+    ):
+        policy.act(_vision_observation())
+
+    assert len(script.requests) == 3
+    assert [
+        message["content"] for message in policy._messages if message.get("role") == "tool"
+    ] == ["note is required: describe what you observe and why you chose this capture"] * 3
+
+
+def test_imageless_capture_is_rejected_without_ending_the_trial() -> None:
+    script = _Script(
+        [
+            _tool_response("take_pic", {"note": "I need the current camera view."}),
+            _tool_response("done", {"summary": "continued after the dropout"}),
+        ]
+    )
+    policy = _policy(script, images="on_demand")
+    policy.bind(_VisionAbsoluteEmbodiment().info)
+    policy.reset(Scene(id="s0", instruction="look"))
+
+    chunk = policy.act(_vision_observation(cameras=()))
+
+    assert chunk.actions[0].meta["stop_reason"] == "done"
+    assert len(script.requests) == 2
+    results = [message["content"] for message in policy._messages if message.get("role") == "tool"]
+    assert results[:2] == [
+        "no camera images are available in this observation",
+        "done: continued after the dropout",
+    ]
+
+
+def test_a_dropout_rejection_does_not_count_toward_the_three_strike_guard() -> None:
+    # The dropout sits between two genuine errors. Treated as an error it would
+    # be the third strike and kill the trial, which is what it did before the
+    # rejection class existed; treated as the free rejection it is, the trial
+    # survives to the next decision.
+    script = _Script(
+        [
+            _tool_response("take_pic", {"note": "  "}, add_default_note=False),
+            _tool_response("take_pic", {"note": "The dropout may have cleared."}),
+            _tool_response("take_pic", {"note": ""}, add_default_note=False),
+            _tool_response("done", {"summary": "survived two errors around a dropout"}),
+        ]
+    )
+    policy = _policy(script, images="on_demand")
+    policy.bind(_VisionAbsoluteEmbodiment().info)
+    policy.reset(Scene(id="s0", instruction="look"))
+
+    chunk = policy.act(_vision_observation(cameras=()))
+
+    assert chunk.actions[0].meta["stop_reason"] == "done"
+    results = [message["content"] for message in policy._messages if message.get("role") == "tool"]
+    assert results[1] == "no camera images are available in this observation"
+    assert results[0] == results[2]
+    assert results[0].startswith("note is required")
+
+
+def test_repeated_imageless_capture_rejections_escalate_with_bounded_calls() -> None:
+    capture = _tool_response(
+        "take_pic",
+        {
+            "cameras": ["top"],
+            "note": "I need the top view despite the camera dropout.",
+        },
+    )
+    script = _Script([capture])
+    policy = _policy(script, images="on_demand", max_llm_calls=50)
+    policy.bind(_VisionAbsoluteEmbodiment().info)
+    policy.reset(Scene(id="s0", instruction="look"))
+
+    rejection = "no camera images are available in this observation"
+    with pytest.raises(RuntimeError, match=f"last error: {rejection}"):
+        policy.act(_vision_observation(cameras=()))
+
+    results = [message["content"] for message in policy._messages if message.get("role") == "tool"]
+    assert results == [rejection] * 4
+    assert len(script.requests) == 4
+    assert len(script.requests) < policy.config.max_llm_calls
+
+
+def test_take_pic_before_move_short_circuits_with_contiguous_results() -> None:
+    script = _Script(
+        [
+            _multi_tool_response(
+                [
+                    ("take_pic", {"note": "I need to look before moving."}),
+                    ("move_joints", {"targets": {"joint": 0.5}}),
+                ]
+            ),
+            _tool_response("done", {"summary": "decided after looking"}),
+        ]
+    )
+    policy = _policy(script, images="on_demand")
+    policy.bind(_VisionAbsoluteEmbodiment().info)
+    policy.reset(Scene(id="s0", instruction="inspect"))
+
+    chunk = policy.act(_vision_observation())
+
+    assert chunk.actions[0].meta["stop_reason"] == "done"
+    history = script.requests[1]["messages"]
+    results = [message for message in history if message.get("role") == "tool"]
+    assert results == [
+        {
+            "role": "tool",
+            "tool_call_id": "call_0",
+            "content": "captured 2 frame(s): 'top', 'wrist'",
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": "ignored: one tool call per turn",
+        },
+    ]
+    result_indices = [history.index(result) for result in results]
+    assert result_indices[1] == result_indices[0] + 1
+    assert {result["tool_call_id"] for result in results} == {"call_0", "call_1"}
+
+
+def test_invalid_capture_after_move_keeps_chunk_and_leaves_queue_slot_open() -> None:
+    script = _Script(
+        [
+            _multi_tool_response(
+                [
+                    ("move_joints", {"targets": {"joint": 0.2}}),
+                    (
+                        "take_pic",
+                        {
+                            "cameras": ["missing"],
+                            "note": "I need a view after the move.",
+                        },
+                    ),
+                    (
+                        "take_pic",
+                        {"cameras": ["top"], "note": "I will use the available top view."},
+                    ),
+                ]
+            )
+        ]
+    )
+    policy = _policy(script, images="on_demand")
+    policy.bind(_VisionAbsoluteEmbodiment().info)
+    policy.reset(Scene(id="s0", instruction="move and inspect"))
+
+    chunk = policy.act(_vision_observation())
+
+    assert len(chunk) == 11
+    assert [message["content"] for message in policy._messages[-3:]] == [
+        "executing move_joints over 11 steps (1.1s)",
+        "unknown or unavailable camera 'missing'; available now: 'top', 'wrist'",
+        "queued: frames arrive with the next observation, after the motion plays",
+    ]
+    assert policy._pending is not None
+    assert policy._pending.requested == ("top",)
+
+
+def test_imageless_capture_after_move_is_rejected_without_queuing() -> None:
+    script = _Script(
+        [
+            _multi_tool_response(
+                [
+                    ("move_joints", {"targets": {"joint": 0.2}}),
+                    (
+                        "take_pic",
+                        {"note": "I need to inspect the result after moving."},
+                    ),
+                ]
+            )
+        ]
+    )
+    policy = _policy(script, images="on_demand")
+    policy.bind(_VisionAbsoluteEmbodiment().info)
+    policy.reset(Scene(id="s0", instruction="move and inspect"))
+
+    chunk = policy.act(_vision_observation(cameras=()))
+
+    assert len(chunk) == 11
+    assert [message["content"] for message in policy._messages[-2:]] == [
+        "executing move_joints over 11 steps (1.1s)",
+        "no camera images are available in this observation",
+    ]
+    assert policy._pending is None
+
+
+def test_two_take_pic_calls_capture_once_and_answer_the_second_ignored() -> None:
+    script = _Script(
+        [
+            _multi_tool_response(
+                [
+                    ("take_pic", {"note": "I need the current views."}),
+                    ("take_pic", {"note": "I am asking twice."}),
+                ]
+            ),
+            _tool_response("done", {"summary": "looked once"}),
+        ]
+    )
+    policy = _policy(script, images="on_demand")
+    policy.bind(_VisionAbsoluteEmbodiment().info)
+    policy.reset(Scene(id="s0", instruction="look"))
+
+    policy.act(_vision_observation())
+
+    results = [message["content"] for message in policy._messages if message.get("role") == "tool"]
+    assert results[:2] == [
+        "captured 2 frame(s): 'top', 'wrist'",
+        "ignored: one tool call per turn",
+    ]
+    image_messages = [
+        message
+        for message in policy._messages
+        if isinstance(message.get("content"), list)
+        and any(part.get("type") == "image_url" for part in message["content"])
+    ]
+    assert len(image_messages) == 1
+
+
+def test_unknown_tool_error_names_take_pic_in_on_demand_mode() -> None:
+    script = _Script(
+        [
+            _tool_response("look", {"note": "wrong tool"}),
+            _tool_response("done", {"summary": "corrected"}),
+        ]
+    )
+    policy = _policy(script, images="on_demand")
+    policy.bind(_VisionAbsoluteEmbodiment().info)
+    policy.reset(Scene(id="s0", instruction="look"))
+
+    policy.act(_vision_observation())
+
+    errors = [message["content"] for message in policy._messages if message.get("role") == "tool"]
+    assert errors[0] == ("unknown tool 'look'; available: move_joints, done, give_up, take_pic")
+
+
+def test_valid_capture_after_an_earlier_error_is_ignored_with_failure_reason() -> None:
+    script = _Script(
+        [
+            _multi_tool_response(
+                [
+                    (
+                        "take_pic",
+                        {"cameras": ["nope"], "note": "I need a camera view."},
+                    ),
+                    (
+                        "take_pic",
+                        {"cameras": ["top"], "note": "I will use the top view."},
+                    ),
+                ]
+            ),
+            _tool_response("done", {"summary": "corrected"}),
+        ]
+    )
+    policy = _policy(script, images="on_demand")
+    policy.bind(_VisionAbsoluteEmbodiment().info)
+    policy.reset(Scene(id="s0", instruction="look"))
+
+    policy.act(_vision_observation())
+
+    results = [message["content"] for message in policy._messages if message.get("role") == "tool"]
+    assert results[:2] == [
+        "unknown or unavailable camera 'nope'; available now: 'top', 'wrist'",
+        "ignored: an earlier call in this turn failed",
+    ]
+
+
+def test_repeated_bare_capture_rejections_escalate_with_bounded_calls() -> None:
+    capture = _tool_response(
+        "take_pic",
+        {"note": "I need every view that has not already been shown."},
+    )
+    script = _Script([capture])
+    policy = _policy(script, images="on_demand", max_llm_calls=50)
+    policy.bind(_VisionAbsoluteEmbodiment().info)
+    policy.reset(Scene(id="s0", instruction="look"))
+
+    with pytest.raises(
+        RuntimeError,
+        match="last error: already shown for this observation",
+    ):
+        policy.act(_vision_observation())
+
+    rejections = [
+        message["content"]
+        for message in policy._messages
+        if message.get("role") == "tool"
+        and str(message["content"]).startswith("already shown for this observation:")
+    ]
+    assert (
+        rejections
+        == [
+            (
+                "already shown for this observation: 'top', 'wrist'; "
+                "the view cannot change until the robot moves"
+            )
+        ]
+        * 4
+    )
+    assert len(script.requests) == 5
+    assert len(script.requests) < policy.config.max_llm_calls
+
+
+def test_named_immediate_capture_reveals_only_unshown_cameras() -> None:
+    script = _Script(
+        [
+            _tool_response(
+                "take_pic",
+                {"cameras": ["top"], "note": "I need the top view."},
+            ),
+            _tool_response(
+                "take_pic",
+                {
+                    "cameras": ["top", "wrist"],
+                    "note": "I also need the wrist view.",
+                },
+            ),
+            _tool_response("done", {"summary": "both seen"}),
+        ]
+    )
+    policy = _policy(script, images="on_demand")
+    policy.bind(_VisionAbsoluteEmbodiment().info)
+    policy.reset(Scene(id="s0", instruction="look"))
+
+    policy.act(_vision_observation())
+
+    results = [message["content"] for message in policy._messages if message.get("role") == "tool"]
+    assert results[:2] == [
+        "captured 1 frame(s): 'top'",
+        "captured 1 frame(s): 'wrist' (already shown: 'top')",
+    ]
+    frame_messages = [
+        message
+        for message in policy._messages
+        if isinstance(message.get("content"), list)
+        and any(part.get("type") == "image_url" for part in message["content"])
+    ]
+    assert frame_messages[1]["content"][0]["text"] == "camera 'wrist' (step 0):"
+    assert len(frame_messages[1]["content"]) == 2
+
+
+def test_chained_capture_arrives_on_next_observation_with_playout_and_residual() -> None:
+    script = _Script(
+        [
+            _multi_tool_response(
+                [
+                    ("move_joints", {"targets": {"joint": 0.2}}),
+                    ("take_pic", {"note": "I need to inspect the result after moving."}),
+                ]
+            ),
+            _tool_response("done", {"summary": "inspected"}),
+        ]
+    )
+    policy = _policy(script, images="on_demand")
+    policy.bind(_VisionAbsoluteEmbodiment().info)
+    policy.reset(Scene(id="s0", instruction="move and look"))
+
+    chunk = policy.act(_vision_observation(env_step=4))
+    policy.act(_vision_observation(q=0.196, env_step=15))
+
+    assert len(chunk) == 11
+    first_results = [
+        message["content"]
+        for message in script.requests[1]["messages"]
+        if message.get("role") == "tool"
+    ]
+    assert first_results == [
+        "executing move_joints over 11 steps (1.1s)",
+        "queued: frames arrive with the next observation, after the motion plays",
+    ]
+    arrived = script.requests[1]["messages"][-1]
+    assert (
+        "The motion finished playing (11 of 11 steps). Largest remaining offset "
+        "from the requested target is 0.004 on joint." in arrived["content"][0]["text"]
+    )
+    assert arrived["content"][1]["text"] == "camera 'top' (step 15):"
+    assert arrived["content"][3]["text"] == "camera 'wrist' (step 15):"
+
+
+def test_chained_capture_reports_default_controller_partial_playout(tmp_path: Path) -> None:
+    script = _Script(
+        [
+            _multi_tool_response(
+                [
+                    ("move_joints", {"targets": {"joint": 0.2}}),
+                    ("take_pic", {"note": "I need to see where one played step ends."}),
+                ]
+            ),
+            _tool_response("done", {"summary": "partial observed"}),
+        ]
+    )
+    ir_eval(
+        _task(max_steps=4),
+        _policy(script, images="on_demand"),
+        _VisionAbsoluteEmbodiment(),
+        log_dir=str(tmp_path),
+        controller=DefaultController(replan_interval=1),
+    )
+
+    arrived = script.requests[1]["messages"][-1]["content"][0]["text"]
+    assert (
+        "The motion played 1 of 11 steps before this observation; it did not run to the end."
+    ) in arrived
+
+
+def test_chained_capture_uses_neutral_narration_when_step_does_not_advance() -> None:
+    script = _Script(
+        [
+            _multi_tool_response(
+                [
+                    ("move_joints", {"targets": {"joint": 0.2}}),
+                    ("take_pic", {"note": "I need the post-motion views."}),
+                ]
+            ),
+            _tool_response("done", {"summary": "observed"}),
+        ]
+    )
+    policy = _policy(script, images="on_demand")
+    policy.bind(_VisionAbsoluteEmbodiment().info)
+    policy.reset(Scene(id="s0", instruction="move"))
+
+    policy.act(_vision_observation(env_step=0))
+    policy.act(_vision_observation(q=0.2, env_step=0))
+
+    arrived = script.requests[1]["messages"][-1]["content"][0]["text"]
+    assert "These frames follow the motion." in arrived
+    assert "finished playing" not in arrived
+    assert "motion played" not in arrived
+
+
+def test_missing_queued_camera_is_narrated_without_raising() -> None:
+    script = _Script(
+        [
+            _multi_tool_response(
+                [
+                    ("move_joints", {"targets": {"joint": 0.1}}),
+                    (
+                        "take_pic",
+                        {
+                            "cameras": ["top", "wrist"],
+                            "note": "I need both views after the move.",
+                        },
+                    ),
+                ]
+            ),
+            _tool_response("done", {"summary": "used available view"}),
+        ]
+    )
+    policy = _policy(script, images="on_demand")
+    policy.bind(_VisionAbsoluteEmbodiment().info)
+    policy.reset(Scene(id="s0", instruction="move"))
+
+    chunk = policy.act(_vision_observation(env_step=0))
+    policy.act(_vision_observation(q=0.1, env_step=len(chunk), cameras=("top",)))
+
+    arrived = script.requests[1]["messages"][-1]["content"]
+    assert "Missing camera(s) in this observation: 'wrist'." in arrived[0]["text"]
+    assert [part["text"] for part in arrived if part["type"] == "text"][1:] == [
+        f"camera 'top' (step {len(chunk)}):"
+    ]
+
+
+def test_queued_capture_is_dropped_when_trial_terminates_and_reset_clears_it(
+    tmp_path: Path,
+) -> None:
+    script = _Script(
+        [
+            _multi_tool_response(
+                [
+                    ("move_joints", {"targets": {"joint": 0.1}}),
+                    ("take_pic", {"note": "I want a frame after this move."}),
+                ]
+            ),
+            _tool_response("done", {"summary": "new trial"}),
+        ]
+    )
+    policy = _policy(script, images="on_demand")
+    ir_eval(
+        _task(max_steps=3),
+        policy,
+        _VisionAbsoluteEmbodiment(terminate_after_first_step=True),
+        log_dir=str(tmp_path),
+    )
+
+    assert policy._pending is not None
+    policy.reset(Scene(id="next", instruction="fresh trial"))
+    assert policy._pending is None
+    policy.act(_vision_observation())
+    fresh_observation = script.requests[1]["messages"][-1]["content"]
+    assert all(part["type"] != "image_url" for part in fresh_observation)
+    assert "These frames follow the motion." not in fresh_observation[0]["text"]
+
+
+def test_take_pic_after_done_is_ignored_because_the_trial_ends() -> None:
+    script = _Script(
+        [
+            _multi_tool_response(
+                [
+                    ("done", {"summary": "finished"}),
+                    ("take_pic", {"note": "This cannot arrive after the stop."}),
+                ]
+            )
+        ]
+    )
+    policy = _policy(script, images="on_demand")
+    policy.bind(_VisionAbsoluteEmbodiment().info)
+    policy.reset(Scene(id="s0", instruction="stop"))
+
+    chunk = policy.act(_vision_observation())
+
+    assert chunk.actions[0].meta["request_stop"] is True
+    assert [message["content"] for message in policy._messages[-2:]] == [
+        "done: finished",
+        "ignored: the trial ends with this call",
+    ]
+    assert policy._pending is None
+
+
+def test_images_mode_is_recorded_and_invalid_values_have_a_fix() -> None:
+    policy = _policy(_Script([_text_response("unused")]), images="on_demand")
+
+    assert policy.config.images == "on_demand"
+    with pytest.raises(ConfigError, match=r"(?s)images must be one of.*fix:"):
+        _policy(_Script([_text_response("unused")]), images="sometimes")
+
+
+def test_on_demand_prompt_and_no_tool_nudge_describe_chaining() -> None:
+    script = _Script(
+        [
+            _text_response("I should use a tool."),
+            _tool_response("done", {"summary": "corrected"}),
+        ]
+    )
+    policy = _policy(script, images="on_demand")
+    policy.bind(_VisionAbsoluteEmbodiment().info)
+    policy.reset(Scene(id="s0", instruction="inspect"))
+
+    policy.act(_vision_observation())
+
+    assert (
+        "Camera images are not attached automatically"
+        in script.requests[0]["messages"][0]["content"]
+    )
+    assert script.requests[1]["messages"][-1]["content"] == (
+        "Respond with one motion tool call, one motion followed by take_pic, or take_pic alone."
+    )
+
+
+def test_effort_defaults_low_and_is_tunable(tmp_path: Path) -> None:
+    script = _Script([_tool_response("done", {"summary": "ok"})])
+    logs = ir_eval(_task(), _policy(script), CubePickEmbodiment(), log_dir=str(tmp_path))
+    # Robot control is latency-sensitive: low effort by default (guardrails
+    # sit below the model, so this trades thinking time, not safety).
+    assert script.requests[0]["reasoning_effort"] == "low"
+    assert logs[0].eval.policy_config["effort"] == "low"
+
+    script = _Script([_tool_response("done", {"summary": "ok"})])
+    ir_eval(_task(), _policy(script, effort="high"), CubePickEmbodiment(), log_dir=str(tmp_path))
+    assert script.requests[0]["reasoning_effort"] == "high"
+
+    script = _Script([_tool_response("done", {"summary": "ok"})])
+    ir_eval(_task(), _policy(script, effort=None), CubePickEmbodiment(), log_dir=str(tmp_path))
+    assert "reasoning_effort" not in script.requests[0]
+
+    # "none" is a wire value, distinct from None (omit the field): GPT-5.x
+    # rejects function tools on chat completions unless reasoning_effort is
+    # explicitly "none", and omitting the field 400s the same way.
+    script = _Script([_tool_response("done", {"summary": "ok"})])
+    ir_eval(_task(), _policy(script, effort="none"), CubePickEmbodiment(), log_dir=str(tmp_path))
+    assert script.requests[0]["reasoning_effort"] == "none"
+
+    with pytest.raises(ConfigError, match=r"or None to omit the field, got 'turbo'"):
+        _policy(_Script([]), effort="turbo")
+
+
+def test_registry_resolves_agent_policy() -> None:
+    from inspect_robots.registry import resolve
+
+    policy = resolve("policy", "agent", model="m", base_url="http://x/v1")
+    assert isinstance(policy, LLMAgentPolicy)
+
+
+def test_non_default_speed_fraction_is_forwarded_through_bind(tmp_path: Path) -> None:
+    script = _Script(
+        [
+            _tool_response("move_joints", {"targets": {"joint": 0.5}}),
+            _tool_response("done", {"summary": "moved"}),
+        ]
+    )
+    sink = _RecordingSink()
+    ir_eval(
+        _task(max_steps=20),
+        _policy(script, max_speed_frac=0.25),
+        _AbsoluteEmbodiment(),
+        log_dir=str(tmp_path),
+        sinks=[sink],
+    )
+    # Distance 0.5 / (0.25 / 10 * range 2) plus relative headroom.
+    assert len(sink.records[0].steps) == 12  # 11 motion steps + done
+
+
+@pytest.mark.parametrize("max_speed_frac", [0.0, -0.1, float("inf"), float("nan")])
+def test_policy_rejects_invalid_max_speed_frac(max_speed_frac: float) -> None:
+    with pytest.raises(ConfigError, match="max_speed_frac must be finite and > 0"):
+        _policy(_Script([]), max_speed_frac=max_speed_frac)
+
+
+def test_policy_rejects_empty_call_budget_and_reads_process_environment() -> None:
+    with pytest.raises(ConfigError, match="max_llm_calls must be >= 1"):
+        LLMAgentPolicy(
+            model="test/model",
+            base_url="http://llm.test/v1",
+            max_llm_calls=0,
+            env={},
+        )
+
+    policy = LLMAgentPolicy(
+        model="test/model",
+        base_url="http://llm.test/v1",
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, request=request)),
+    )
+    assert policy.info.name == "agent"
+
+
+def test_chat_transport_failure_and_close_are_well_defined() -> None:
+    provider = resolve_provider(
+        model="test/model",
+        base_url="http://llm.test/v1",
+        api_key_env=None,
+        env={},
+    )
+
+    def fail(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("offline", request=request)
+
+    client = ChatClient(
+        provider,
+        transport=httpx.MockTransport(fail),
+        max_retries=1,
+        backoff_s=0.0,
+    )
+    with pytest.raises(RuntimeError, match="offline"):
+        client.complete(messages=[], tools=[])
+    client.close()
+
+
+def test_png_encoder_accepts_float_grayscale_frames() -> None:
+    encoded = encode_png(np.array([[0.5]], dtype=np.float64))
+    assert encoded.startswith(b"\x89PNG\r\n\x1a\n")
+
+
+def test_unbound_act_raises_clear_error() -> None:
+    from inspect_robots.types import Observation
+
+    policy = _policy(_Script([_text_response("hi")]))
+    with pytest.raises(RuntimeError, match="bind"):
+        policy.act(Observation())
+
+
+def test_on_trial_end_writes_transcript_and_strips_images(tmp_path: Path) -> None:
+    # A test for the on_trial_end hook in the agent policy.
+    # It must strip images out but leave everything else, and store the path
+    # in the trial metadata.
+    script = _Script([_tool_response("done", {"summary": "done"})])
+    sink = _RecordingSink()
+    logs = ir_eval(
+        _task(), _policy(script), CubePickEmbodiment(), log_dir=str(tmp_path), sinks=[sink]
+    )
+    assert logs[0].status == "success"
+
+    # Metadata should contain transcript path
+    (record,) = sink.records
+    assert "transcript" in record.metadata
+    transcript_rel = record.metadata["transcript"]
+    assert transcript_rel.startswith("transcripts/")
+
+    # Transcript should exist on disk
+    transcript_path = tmp_path / transcript_rel
+    assert transcript_path.is_file()
+
+    # Verify the JSONL content and image stripping
+    lines = transcript_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 5  # System, Goal, Observation, ToolCall, ToolResponse
+
+    system, goal, obs, asst, tool_resp = [json.loads(line) for line in lines]
+    assert system["role"] == "system"
+    assert goal["role"] == "user"
+    assert obs["role"] == "user"
+    assert asst["role"] == "assistant"
+    assert tool_resp["role"] == "tool"
+
+    # Observation parts should not contain 'image_url' (they were stripped)
+    obs_parts = obs["content"]
+    assert any(p["type"] == "text" for p in obs_parts)
+    assert all(p["type"] != "image_url" for p in obs_parts)
+
+
+def test_anthropic_usage_is_summed_into_trial_metadata(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    payloads = [
+        {
+            "id": "msg_move",
+            "type": "message",
+            "stop_reason": "tool_use",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_move",
+                    "name": "move_by",
+                    "input": {
+                        "deltas": {"dx": 0.01},
+                        "note": "I see the cube and move toward it.",
+                    },
+                }
+            ],
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 2,
+                "cache_creation_input_tokens": 4,
+                "cache_read_input_tokens": 0,
+            },
+        },
+        {
+            "id": "msg_done",
+            "type": "message",
+            "stop_reason": "tool_use",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_done",
+                    "name": "done",
+                    "input": {"summary": "done"},
+                }
+            ],
+            "usage": {
+                "input_tokens": 12,
+                "output_tokens": 3,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 7,
+            },
+        },
+    ]
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        payload = payloads[min(calls, len(payloads) - 1)]
+        calls += 1
+        return httpx.Response(200, json=payload)
+
+    sink = _RecordingSink()
+    policy = LLMAgentPolicy(
+        model="claude-opus-5",
+        wire="anthropic",
+        base_url="http://llm.test/v1",
+        transcript_echo=True,
+        transport=httpx.MockTransport(handler),
+        env={},
+    )
+    ir_eval(_task(), policy, CubePickEmbodiment(), log_dir=str(tmp_path), sinks=[sink])
+
+    assert sink.records[0].metadata["llm_usage"] == {
+        "llm_calls": 2,
+        "input_tokens": 22,
+        "output_tokens": 5,
+        "cache_creation_input_tokens": 4,
+        "cache_read_input_tokens": 7,
+    }
+    stderr = capsys.readouterr().err
+    assert "[agent] -- usage: in=10 cache_read=0 out=2" in stderr
+    assert "[agent] -- usage: in=12 cache_read=7 out=3" in stderr
+
+
+def test_reset_clears_usage_accumulated_by_the_previous_trial(tmp_path: Path) -> None:
+    script = _Script([_tool_response("done", {"summary": "done"})])
+    policy = _policy(script)
+    policy.bind(CubePickEmbodiment().info)
+    policy.reset(Scene(id="old", instruction="stop"))
+    policy.act(Observation())
+
+    policy.reset(Scene(id="fresh", instruction="wait"))
+    record = TrialRecord(scene_id="fresh", epoch=0, seed=0)
+    policy.on_trial_end(record, str(tmp_path), "run")
+
+    assert "llm_usage" not in record.metadata
+
+
+def test_trial_with_zero_llm_calls_omits_usage_metadata(tmp_path: Path) -> None:
+    policy = _policy(_Script([_text_response("unused")]))
+    policy.reset(Scene(id="s0", instruction="wait"))
+    record = TrialRecord(scene_id="s0", epoch=0, seed=0)
+
+    policy.on_trial_end(record, str(tmp_path), "run")
+
+    assert "llm_usage" not in record.metadata
+
+
+def test_chat_wire_usage_metadata_counts_calls_only(tmp_path: Path) -> None:
+    script = _Script(
+        [
+            _tool_response("move_by", {"deltas": {"dx": 0.01}}),
+            _tool_response("done", {"summary": "done"}),
+        ]
+    )
+    sink = _RecordingSink()
+
+    ir_eval(
+        _task(),
+        _policy(script),
+        CubePickEmbodiment(),
+        log_dir=str(tmp_path),
+        sinks=[sink],
+    )
+
+    assert sink.records[0].metadata["llm_usage"] == {"llm_calls": 2}
