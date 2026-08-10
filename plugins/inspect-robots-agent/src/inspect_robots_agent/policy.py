@@ -60,6 +60,7 @@ _EFFORT_LEVELS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh",
 _WIRE_FORMATS = frozenset({"chat", "responses", "anthropic"})
 _SPEEDS = frozenset({"fast"})
 _IMAGE_MODES = frozenset({"always", "on_demand"})
+_DEPTH_MODES = frozenset({"render", "off"})
 
 _SYSTEM_TEMPLATE = """You are controlling a real robot embodiment named {name!r} \
 through tool calls. Each observation message gives you the current \
@@ -186,6 +187,7 @@ class AgentPolicyConfig(PolicyConfig):
     max_speed_frac: float = 0.1
     transcript_echo: bool = False
     images: str = "always"
+    depth: str = "render"
     image_horizon: int | None = 2
 
 
@@ -222,6 +224,7 @@ class LLMAgentPolicy(PolicyBase):
         max_speed_frac: float = 0.1,
         transcript_echo: bool = False,
         images: str = "always",
+        depth: str = "render",
         image_horizon: int | None = 2,
         transport: httpx.BaseTransport | None = None,
         env: dict[str, str] | None = None,
@@ -248,6 +251,11 @@ class LLMAgentPolicy(PolicyBase):
             raise ConfigError(
                 f"images must be one of {sorted(_IMAGE_MODES)}, got {images!r}.\n"
                 "fix: pass -P images=always or -P images=on_demand"
+            )
+        if depth not in _DEPTH_MODES:
+            raise ConfigError(
+                f"depth must be one of {sorted(_DEPTH_MODES)}, got {depth!r}.\n"
+                "fix: pass -P depth=render or -P depth=off"
             )
         if wire != "anthropic":
             # A dropped speed would bill at standard rates while the user
@@ -376,6 +384,7 @@ class LLMAgentPolicy(PolicyBase):
         self._max_speed_frac = max_speed_frac
         self._transcript_echo = transcript_echo
         self._images = images
+        self._depth = depth
         self._image_horizon = image_horizon
         self.config = AgentPolicyConfig(
             temperature=temperature,
@@ -390,6 +399,7 @@ class LLMAgentPolicy(PolicyBase):
             max_speed_frac=max_speed_frac,
             transcript_echo=transcript_echo,
             images=images,
+            depth=depth,
             image_horizon=image_horizon,
         )
         # Placeholder until bind(); eval() always binds before compat/rollout.
@@ -516,6 +526,7 @@ class LLMAgentPolicy(PolicyBase):
             self._state_labels,
             reveal=reveal,
             narration=narration,
+            depth=self._depth,
         )
         if self._images == "on_demand":
             available = _quoted_names(tuple(observation.images))
@@ -798,6 +809,7 @@ def _observation_content(
     *,
     reveal: tuple[str, ...] | None = None,
     narration: str | None = None,
+    depth: str = "render",
 ) -> list[dict[str, Any]]:
     """State as readable text plus camera frames as inline PNG data URLs."""
     lines = ["Current observation."]
@@ -808,6 +820,8 @@ def _observation_content(
         lines.append(narration)
     parts: list[dict[str, Any]] = [{"type": "text", "text": "\n".join(lines)}]
     parts.extend(_image_parts(observation, reveal=reveal))
+    if depth == "render":
+        parts.extend(_depth_parts(observation))
     return parts
 
 
@@ -828,6 +842,45 @@ def _image_parts(
         parts.append({"type": "text", "text": f"camera {name!r}{suffix}:"})
         parts.append({"type": "image_url", "image_url": {"url": png_data_url(image)}})
     return parts
+
+
+def _depth_parts(observation: Observation) -> list[dict[str, Any]]:
+    """Render depth maps carried in observation.extra as grayscale PNGs."""
+    depth = observation.extra.get("depth")
+    if not isinstance(depth, dict):
+        return []
+    parts: list[dict[str, Any]] = []
+    step_label = _step_label(observation)
+    suffix = f" ({step_label})" if step_label else ""
+    for name, value in depth.items():
+        if not isinstance(name, str):
+            continue
+        image = _render_depth(value)
+        if image is None:
+            continue
+        parts.append({"type": "text", "text": f"depth {name!r}{suffix}:"})
+        parts.append({"type": "image_url", "image_url": {"url": png_data_url(image)}})
+    return parts
+
+
+def _render_depth(value: object) -> npt.NDArray[np.uint8] | None:
+    """Normalize a 2D depth map into a visible uint8 image."""
+    array = np.asarray(value)
+    if array.ndim != 2 or array.size == 0 or not np.issubdtype(array.dtype, np.number):
+        return None
+    finite = np.isfinite(array)
+    if not finite.any():
+        return None
+    values = array.astype(np.float64, copy=False)
+    lo = float(np.min(values[finite]))
+    hi = float(np.max(values[finite]))
+    if hi == lo:
+        normalized = np.zeros(values.shape, dtype=np.uint8)
+    else:
+        clipped = np.clip((values - lo) / (hi - lo), 0.0, 1.0)
+        normalized = np.round(clipped * 255.0).astype(np.uint8)
+    normalized[~finite] = 0
+    return np.repeat(normalized[:, :, None], 3, axis=2)
 
 
 def _quoted_names(names: tuple[str, ...]) -> str:
